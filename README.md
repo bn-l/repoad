@@ -93,9 +93,9 @@ The generated markdown file will look something like this:
 
 ## Features
 
-- **Fast**: Built in Rust for performance. It uses a shallow git clone (`--depth=1`) to only download the latest version of the repository, saving time and bandwidth.
+- **Fast**: Rust and uses clone --depth=1
 - **Flexible**: Process a whole repository or just a subdirectory. Filter by file extensions.
-- **Simple**: Does one thing well.
+- **Simple**: Does one thing well (imo).
 
 ## Installation
 
