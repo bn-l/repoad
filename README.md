@@ -76,19 +76,19 @@ repoad charmbracelet/soft-serve -e go,md
 The generated markdown file will look something like this:
 
 ```markdown
-# charmbracelet/soft-serve
+    # charmbracelet/soft-serve
 
-## soft-serve.go
+    ## soft-serve.go
 
-```go
-// ... (file content) ...
-```
+    ```go
+    // ... (file content) ...
+    ```
 
-## cmd/soft/main.go
+    ## cmd/soft/main.go
 
-```go
-// ... (file content) ...
-```
+    ```go
+    // ... (file content) ...
+    ```
 ```
 
 ## Features
