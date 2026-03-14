@@ -1,59 +1,53 @@
 use std::{
     collections::HashSet,
     fs,
+    io::{self, Cursor},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
-use clap::{arg, Parser, ValueHint};
+use anyhow::{anyhow, Context, Result};
+use clap::{arg, ArgAction, Parser, ValueHint};
 use content_inspector::{inspect, ContentType};
-// use git2::Repository;
+use flate2::read::GzDecoder;
+use reqwest::blocking::Client;
+use serde_json::Value;
+use tar::Archive;
 use tempfile::TempDir;
 use walkdir::{DirEntry, WalkDir};
 
-/// Extracts text files from a GitHub repo path (owner/repo[/sub/path])
+/// Extracts text files from either a GitHub repo **or** an npm package
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    /// Repository in `owner/repo[/sub/path]` form
+    /// GitHub `owner/repo[/sub/path]` **or** npm `package`
     #[arg(value_hint = ValueHint::Other)]
-    repo: String,
+    target: String,
 
     /// Comma-separated list of file extensions to include (e.g. rs,md,txt)
     #[arg(short, long, value_delimiter = ',')]
     extensions: Vec<String>,
+
+    /// Treat `target` as an npm package name instead of a GitHub repo
+    #[arg(short = 'n', long = "npm-mode", action = ArgAction::SetTrue)]
+    npm_mode: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (owner, repo, sub_path) = parse_repo_path(&args.repo)?;
 
-    // --- Clone into a temp dir that cleans itself up automatically -----------
+    // ---------------- acquire sources into a temp dir ------------------------
     let tmp = TempDir::new().context("failed to create temporary directory")?;
-    let repo_url = format!("https://github.com/{owner}/{repo}.git");
-    println!("Cloning {repo_url} …");
-    
-    let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options({
-        let mut fetch_opts = git2::FetchOptions::new();
-        fetch_opts.depth(1);
-        fetch_opts
-    });
-    builder.clone(&repo_url, tmp.path())
-        .with_context(|| format!("failed to clone {repo_url}"))?;
+    let (root, title) = if args.npm_mode {
+        download_npm_package(&args.target, tmp.path())?
+    } else {
+        clone_github_repo(&args.target, tmp.path())?
+    };
 
-    // --- Walk files ----------------------------------------------------------
-    let target_root = tmp.path().join(&sub_path);
-    anyhow::ensure!(
-        target_root.exists(),
-        "path '{}' does not exist in repository", sub_path.display()
-    );
-
+    // ---------------- walk files & build markdown ---------------------------
     let allowed_exts: HashSet<_> = args.extensions.iter().map(String::as_str).collect();
-    let mut markdown = String::new();
-    markdown.push_str(&format!("# {owner}/{repo}\n\n"));
+    let mut md = format!("# {title}\n\n");
 
-    WalkDir::new(&target_root)
+    WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
         .filter_entry(skip_git)
@@ -83,27 +77,87 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             };
-
             let lang = lang_for_ext(path.extension().and_then(|s| s.to_str()).unwrap_or(""));
 
-            markdown.push_str(&format!("## {}\n\n```{}\n", rel.display(), lang));
-            markdown.push_str(&src);
+            md.push_str(&format!("## {}\n\n```{}\n", rel.display(), lang));
+            md.push_str(&src);
             if !src.ends_with('\n') {
-                markdown.push('\n');
+                md.push('\n');
             }
-            markdown.push_str("```\n\n");
+            md.push_str("```\n\n");
             println!("Added {rel:?}");
             Ok(())
         })?;
 
-    // --- Write output --------------------------------------------------------
-    let outfile = PathBuf::from(format!("{}.md", args.repo.replace('/', "-")));
-    fs::write(&outfile, markdown).with_context(|| format!("writing {outfile:?}"))?;
+    // ---------------- write output ------------------------------------------
+    let outfile = PathBuf::from(format!("{}.md", title.replace('/', "-")));
+    fs::write(&outfile, md).with_context(|| format!("writing {outfile:?}"))?;
     println!("Written {}", outfile.display());
     Ok(())
 }
 
-// ---------- helpers ----------------------------------------------------------
+// ---------- acquisition helpers ---------------------------------------------
+
+/// Clone GitHub repo just like before
+fn clone_github_repo(spec: &str, dest: &Path) -> Result<(PathBuf, String)> {
+    let (owner, repo, sub_path) = parse_repo_path(spec)?;
+    let repo_url = format!("https://github.com/{owner}/{repo}.git");
+    println!("Cloning {repo_url} …");
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options({
+        let mut f = git2::FetchOptions::new();
+        f.depth(1);
+        f
+    });
+    builder
+        .clone(&repo_url, dest)
+        .with_context(|| format!("failed to clone {repo_url}"))?;
+
+    let root = dest.join(&sub_path);
+    anyhow::ensure!(
+        root.exists(),
+        "path '{}' does not exist in repository",
+        sub_path.display()
+    );
+    Ok((root, format!("{owner}/{repo}")))
+}
+
+/// Download and unpack an npm package into `dest`
+fn download_npm_package(pkg: &str, dest: &Path) -> Result<(PathBuf, String)> {
+    println!("Resolving npm package '{pkg}' …");
+    let client = Client::builder()
+        .user_agent("md-extract/0.1")
+        .build()?;
+
+    // 1. registry metadata
+    let meta: Value = client
+        .get(format!("https://registry.npmjs.org/{pkg}"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    // 2. pick latest version tarball
+    let latest = meta["dist-tags"]["latest"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no 'latest' dist-tag"))?;
+    let tar_url = meta["versions"][latest]["dist"]["tarball"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing tarball url"))?;
+
+    println!("Downloading {tar_url} …");
+    let bytes = client.get(tar_url).send()?.error_for_status()?.bytes()?;
+
+    // 3. unpack
+    let gz = GzDecoder::new(Cursor::new(bytes));
+    let mut archive = Archive::new(gz);
+    archive.unpack(dest)?;
+
+    // npm packages unpack into `package/…`
+    Ok((dest.join("package"), pkg.to_owned()))
+}
+
+// ---------- misc helpers (unchanged) ----------------------------------------
 
 fn parse_repo_path(s: &str) -> Result<(String, String, PathBuf)> {
     let mut parts = s.trim_matches('/').splitn(3, '/');
@@ -149,4 +203,4 @@ fn lang_for_ext(ext: &str) -> &str {
         "toml" => "toml",
         _ => "",
     }
-} 
+}
