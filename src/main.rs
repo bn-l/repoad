@@ -1,25 +1,25 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Cursor},
+    io::Cursor,
     path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
-use clap::{arg, ArgAction, Parser, ValueHint};
+use clap::{ArgAction, Parser, ValueHint};
 use content_inspector::{inspect, ContentType};
 use flate2::read::GzDecoder;
+use ignore::WalkBuilder;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use tar::Archive;
 use tempfile::TempDir;
-use walkdir::{DirEntry, WalkDir};
 
-/// Extracts text files from either a GitHub repo **or** an npm package
+/// Extracts text files from a local directory, GitHub repo, or npm package
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    /// GitHub `owner/repo[/sub/path]` **or** npm `package`
+    /// Local path, GitHub `owner/repo[/sub/path]`, or npm `package`
     #[arg(value_hint = ValueHint::Other)]
     target: String,
 
@@ -35,59 +35,91 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // ---------------- acquire sources into a temp dir ------------------------
-    let tmp = TempDir::new().context("failed to create temporary directory")?;
-    let (root, title) = if args.npm_mode {
-        download_npm_package(&args.target, tmp.path())?
+    let target_path = Path::new(&args.target);
+    let is_local = target_path.exists() && target_path.is_dir();
+
+    // ---------------- acquire sources ----------------------------------------
+    let tmp; // keep TempDir alive for remote modes
+    let (root, title, strip_prefix) = if is_local {
+        let canonical = fs::canonicalize(target_path)
+            .with_context(|| format!("cannot resolve '{}'", args.target))?;
+        let name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "local".to_owned());
+        (canonical.clone(), name, canonical)
     } else {
-        clone_github_repo(&args.target, tmp.path())?
+        tmp = TempDir::new().context("failed to create temporary directory")?;
+        let (root, title) = if args.npm_mode {
+            download_npm_package(&args.target, tmp.path())?
+        } else {
+            clone_github_repo(&args.target, tmp.path())?
+        };
+        (root, title, tmp.path().to_path_buf())
     };
 
     // ---------------- walk files & build markdown ---------------------------
     let allowed_exts: HashSet<_> = args.extensions.iter().map(String::as_str).collect();
     let mut md = format!("# {title}\n\n");
 
-    WalkDir::new(&root)
+    let walker = WalkBuilder::new(&root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(skip_git)
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .try_for_each(|entry| -> Result<()> {
-            let path = entry.path();
-            let rel = path.strip_prefix(tmp.path()).unwrap();
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .hidden(false) // don't skip dotfiles unless .gitignore says so
+        .build();
 
-            // extension filter
-            if !allowed_exts.is_empty() {
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                if !allowed_exts.contains(ext) {
-                    return Ok(());
-                }
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                println!("Walk error: {e}");
+                continue;
             }
+        };
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
 
-            if !is_likely_text(path) {
-                println!("Skipping binary {rel:?}");
-                return Ok(());
+        // skip .git internals
+        if path.components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
+
+        let rel = path.strip_prefix(&strip_prefix).unwrap_or(path);
+
+        // extension filter
+        if !allowed_exts.is_empty() {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if !allowed_exts.contains(ext) {
+                continue;
             }
+        }
 
-            let src = match fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(e) => {
-                    println!("Skipping {rel:?}: {e}");
-                    return Ok(());
-                }
-            };
-            let lang = lang_for_ext(path.extension().and_then(|s| s.to_str()).unwrap_or(""));
+        if !is_likely_text(path) {
+            println!("Skipping binary {rel:?}");
+            continue;
+        }
 
-            md.push_str(&format!("## {}\n\n```{}\n", rel.display(), lang));
-            md.push_str(&src);
-            if !src.ends_with('\n') {
-                md.push('\n');
+        let src = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                println!("Skipping {rel:?}: {e}");
+                continue;
             }
-            md.push_str("```\n\n");
-            println!("Added {rel:?}");
-            Ok(())
-        })?;
+        };
+        let lang = lang_for_ext(path.extension().and_then(|s| s.to_str()).unwrap_or(""));
+
+        md.push_str(&format!("## {}\n\n```{}\n", rel.display(), lang));
+        md.push_str(&src);
+        if !src.ends_with('\n') {
+            md.push('\n');
+        }
+        md.push_str("```\n\n");
+        println!("Added {rel:?}");
+    }
 
     // ---------------- write output ------------------------------------------
     let outfile = PathBuf::from(format!("{}.md", title.replace('/', "-")));
@@ -167,12 +199,6 @@ fn parse_repo_path(s: &str) -> Result<(String, String, PathBuf)> {
     Ok((owner, repo, PathBuf::from(sub)))
 }
 
-fn skip_git(entry: &DirEntry) -> bool {
-    !entry
-        .path()
-        .components()
-        .any(|c| c.as_os_str() == ".git")
-}
 
 fn is_likely_text(path: &Path) -> bool {
     match fs::read(path) {
